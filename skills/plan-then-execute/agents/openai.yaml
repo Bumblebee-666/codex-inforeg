@@ -1,0 +1,4 @@
+interface:
+  display_name: "Plan Then Execute"
+  short_description: "Require a plan before code changes"
+  default_prompt: "Before any code changes, present a plan and wait for approval."

@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.pyo
+
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+ckpt/
+logs/
+results/
+
+.vscode/sftp.json
+
+.DS_Store
+Thumbs.db
