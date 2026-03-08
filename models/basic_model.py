@@ -65,41 +65,52 @@ class AVClassifier(nn.Module):
 
     def forward(self, audio, visual):
 
-        a = self.audio_net(audio)
-        v = self.visual_net(visual)
+        a_raw = self.audio_net(audio)
+        v_raw = self.visual_net(visual)
+
+        a_fusion = a_raw
+        v_fusion = v_raw
 
         if self.use_cross_gate and self.cross_gate is not None:
-            a, v = self.cross_gate(a, v)
+            a_fusion, v_fusion = self.cross_gate(a_raw, v_raw)
 
-        (_, C, H, W) = v.size()
-        B = a.size()[0]
-        v = v.view(B, -1, C, H, W)
-        v = v.permute(0, 2, 1, 3, 4)
+        (_, fusion_C, fusion_H, fusion_W) = v_fusion.size()
+        B = a_raw.size(0)
+        v_fusion = v_fusion.view(B, -1, fusion_C, fusion_H, fusion_W)
+        v_fusion = v_fusion.permute(0, 2, 1, 3, 4)
 
-        a = F.adaptive_avg_pool2d(a, 1)
-        v = F.adaptive_avg_pool3d(v, 1)
+        (_, raw_C, raw_H, raw_W) = v_raw.size()
+        v_raw = v_raw.view(B, -1, raw_C, raw_H, raw_W)
+        v_raw = v_raw.permute(0, 2, 1, 3, 4)
 
-        a = torch.flatten(a, 1)
-        v = torch.flatten(v, 1)
+        a_fusion = F.adaptive_avg_pool2d(a_fusion, 1)
+        v_fusion = F.adaptive_avg_pool3d(v_fusion, 1)
+        a_raw = F.adaptive_avg_pool2d(a_raw, 1)
+        v_raw = F.adaptive_avg_pool3d(v_raw, 1)
+
+        a_fusion = torch.flatten(a_fusion, 1)
+        v_fusion = torch.flatten(v_fusion, 1)
+        a_raw = torch.flatten(a_raw, 1)
+        v_raw = torch.flatten(v_raw, 1)
         
         if self.usegate:
-            out_a = self.fc_x(a)
-            out_v = self.fc_y(v)
-            out_audio=self.head_audio(a)
-            out_video=self.head_video(v)
+            out_a = self.fc_x(a_fusion)
+            out_v = self.fc_y(v_fusion)
+            out_audio=self.head_audio(a_raw)
+            out_video=self.head_video(v_raw)
             gate = self.sigmoid(out_a)
             out = self.head2(torch.mul(gate, out_v))
             
         else:
-            out = torch.cat((a,v),1)
+            out = torch.cat((a_fusion, v_fusion),1)
             out = self.head(out)
 
-            out_audio=self.head_audio(a)
-            out_video=self.head_video(v)
+            out_audio=self.head_audio(a_raw)
+            out_video=self.head_video(v_raw)
             
 
 
-        return a, v, out_audio, out_video, out
+        return a_raw, v_raw, out_audio, out_video, out
 
 
 class TriModalClassifier(nn.Module):

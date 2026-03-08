@@ -73,9 +73,9 @@ def get_arguments():
     parser.add_argument('--focal_gamma', default=2.0, type=float, help='Gamma for Focal Loss (deprecated, use start/end)')
     parser.add_argument('--focal_gamma_start', default=0.0, type=float, help='Starting gamma for Focal Loss')
     parser.add_argument('--focal_gamma_end', default=2.0, type=float, help='Ending gamma for Focal Loss')
-    parser.add_argument('--sw_mode', default='prime_window', type=str, choices=['prime_window', 'always', 'epoch_range'])
+    parser.add_argument('--sw_mode', default='epoch_range', type=str, choices=['prime_window', 'always', 'epoch_range'])
     parser.add_argument('--sw_k_threshold', default=0.05, type=float)
-    parser.add_argument('--sw_start_epoch', default=0, type=int)
+    parser.add_argument('--sw_start_epoch', default=5, type=int)
     parser.add_argument('--sw_end_epoch', default=30, type=int)
     parser.add_argument('--lambda_audio', default=1.0, type=float, help='Weight for audio branch loss')
     parser.add_argument('--lambda_visual', default=1.25, type=float, help='Weight for visual branch loss')
@@ -85,8 +85,60 @@ def get_arguments():
     parser.add_argument('--cmob_visual_boost', default=0.2, type=float, help='Extra visual branch support when audio dominates')
     parser.add_argument('--cmob_gap_scale', default=1.0, type=float, help='Scale factor applied to CMoB gap')
     parser.add_argument('--cmob_audio_grad_scale', default=1.0, type=float, help='Gradient scale for audio when visual dominates (>1 boosts audio learning)')
+    parser.add_argument('--best_target_acc', default=0.76, type=float, help='Target total accuracy threshold for joint-best checkpointing')
+    parser.add_argument('--best_target_audio_acc', default=0.615, type=float, help='Target audio accuracy threshold for joint-best checkpointing')
+    parser.add_argument('--best_target_visual_acc', default=0.615, type=float, help='Target visual accuracy threshold for joint-best checkpointing')
 
     return parser.parse_args()
+
+
+def compute_trace_k(trace_list, window=10):
+    if trace_list is None or len(trace_list) < window + 1:
+        return 0.0
+
+    current_window = trace_list[-window:]
+    previous_window = trace_list[-(window + 1):-1]
+    current_mean = float(np.mean(current_window))
+    previous_mean = float(np.mean(previous_window))
+    denominator = max(abs(current_mean), 1e-8)
+    return (current_mean - previous_mean) / denominator
+
+
+def save_training_checkpoint(args, model, optimizer, scheduler, epoch, acc, acc_a, acc_v, tag='best_model'):
+    os.makedirs(args.ckpt_path, exist_ok=True)
+    acc_str = '{:.4f}'.format(acc)
+    acc_a_str = '{:.4f}'.format(acc_a)
+    acc_v_str = '{:.4f}'.format(acc_v)
+
+    model_name = '{}_of_dataset_{}_{}_alpha_{}_' \
+                 'optimizer_{}_training_epochs_{}_' \
+                 'epoch_{}_acc_{}_acca_{}_accv_{}.pth'.format(tag,
+                                                              args.dataset,
+                                                              args.modulation,
+                                                              args.alpha,
+                                                              args.optimizer,
+                                                              args.modulation_starts,
+                                                              epoch,
+                                                              acc_str,
+                                                              acc_a_str,
+                                                              acc_v_str)
+
+    saved_dict = {
+        'saved_epoch': epoch,
+        'modulation': args.modulation,
+        'alpha': args.alpha,
+        'fusion': args.fusion_method,
+        'acc': acc,
+        'acc_a': acc_a,
+        'acc_v': acc_v,
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'scheduler': scheduler.state_dict(),
+    }
+
+    save_dir = os.path.join(args.ckpt_path, model_name)
+    torch.save(saved_dict, save_dir)
+    return save_dir
 
 
 
@@ -255,18 +307,14 @@ def log_images_to_tensorboard(writer, dataloader, device, phase='train'):
 
 def train_epoch(args, epoch, model, device, dataloader, optimizer, scheduler, writer=None, visual_trace_list=None, audio_trace_list=None,epoch_data_lists=None):
     cmob_tool = CMoB(device) if args.use_cmob else None
+    audio_trace_list = audio_trace_list if audio_trace_list is not None else []
+    visual_trace_list = visual_trace_list if visual_trace_list is not None else []
     total_audio_grad_sum = 0
     total_visual_grad_sum = 0
     total_audio_count = 0
     total_visual_count = 0
     alpha1 = 0 
-    if epoch == 0:
-        k = 1
-    else:
-        tr1 = sum(audio_trace_list[-10:])/10
-        tr2 = sum(audio_trace_list[-11:-1])/10
-        
-        k = (tr1 - tr2)/tr1
+    k = compute_trace_k(audio_trace_list)
         
 
 
@@ -288,14 +336,22 @@ def train_epoch(args, epoch, model, device, dataloader, optimizer, scheduler, wr
         elif args.sw_mode == 'epoch_range':
             sw_enabled = (epoch >= args.sw_start_epoch) and (epoch <= args.sw_end_epoch)
         else:
-            sw_enabled = (k > args.sw_k_threshold)
+            sw_enabled = (len(audio_trace_list) >= 11) and (k > args.sw_k_threshold)
 
         if sw_enabled:
-            progress = min(1.0, epoch / max(1, args.lr_decay_step))
+            if args.sw_mode == 'epoch_range':
+                progress = min(1.0, max(0.0, (epoch - args.sw_start_epoch) / max(1, args.sw_end_epoch - args.sw_start_epoch)))
+            else:
+                progress = min(1.0, epoch / max(1, args.lr_decay_step))
             current_gamma = args.focal_gamma_start + (args.focal_gamma_end - args.focal_gamma_start) * progress
             focal_criterion = FocalLoss(gamma=current_gamma)
 
-    def criterion_fn(logits, targets):
+    if writer is not None:
+        writer.add_scalar('training/trace_k', k, epoch)
+        writer.add_scalar('training/sw_enabled', float(sw_enabled), epoch)
+        writer.add_scalar('training/focal_gamma', current_gamma, epoch)
+
+    def branch_criterion_fn(logits, targets):
         if args.use_sample_weighting and sw_enabled and focal_criterion is not None:
             return focal_criterion(logits, targets)
         return ce_criterion(logits, targets)
@@ -425,9 +481,9 @@ def train_epoch(args, epoch, model, device, dataloader, optimizer, scheduler, wr
         #     out_a = (torch.mm(a, torch.transpose(model.module.fusion_module.fc_out.weight[:, :weight_size // 2], 0, 1))
         #              + model.module.fusion_module.fc_out.bias / 2)
 
-        loss = criterion_fn(out, label)
-        loss_out_v = criterion_fn(out_v, label)
-        loss_out_a = criterion_fn(out_a, label)
+        loss = ce_criterion(out, label)
+        loss_out_v = branch_criterion_fn(out_v, label)
+        loss_out_a = branch_criterion_fn(out_a, label)
         weighted_loss_out_a = args.lambda_audio * loss_out_a
         weighted_loss_out_v = args.lambda_visual * loss_out_v
 
@@ -518,7 +574,7 @@ def train_epoch(args, epoch, model, device, dataloader, optimizer, scheduler, wr
 
         if args.use_cmob:
             # CMoB: gap-aware modulation with EMA smoothing and capped beta
-            gap, te_a, te_v = cmob_tool.calculate_causal_gap(model, spec, image, label, criterion_fn)
+            gap, te_a, te_v = cmob_tool.calculate_causal_gap(model, spec, image, label, ce_criterion)
             scaled_gap = gap * args.cmob_gap_scale
             if ema_gap is None:
                 ema_gap = scaled_gap.detach()
@@ -738,8 +794,8 @@ def main():
     avarage_gradient_visual_list = []
     avarage_gradient_audio_list = []
     
-    visual_trace_list = [0,0,0,0,0,0,0,0,0,0]
-    audio_trace_list = [0,0,0,0,0,0,0,0,0,0]
+    visual_trace_list = []
+    audio_trace_list = []
 
 
 
@@ -792,6 +848,7 @@ def main():
     if args.train:
 
         best_acc = 0.0
+        best_joint_acc = 0.0
 
         for epoch in range(args.epochs):
             total_audio_grad_sum = 0
@@ -905,41 +962,27 @@ def main():
                 visual_FGNList.append((visual_NewNorm - visual_OldNorm) / visual_NewNorm)
                 print("visual_FGN:", (visual_NewNorm - visual_OldNorm) / visual_OldNorm)
 
-            print('Epoch:  {}   Loss: {:.3f}  Acc: {:.3f}  Audio Acc: {:.3f}  Visual Acc: {:.3f}  Best Acc: {:.3f}'.format(epoch, batch_loss, acc, acc_a, acc_v, max(best_acc, acc)))
+            joint_target_met = acc >= args.best_target_acc and acc_a >= args.best_target_audio_acc and acc_v >= args.best_target_visual_acc
+
+            print('Epoch:  {}   Loss: {:.3f}  Acc: {:.3f}  Audio Acc: {:.3f}  Visual Acc: {:.3f}  Best Acc: {:.3f}  Best Joint Acc: {:.3f}'.format(
+                epoch, batch_loss, acc, acc_a, acc_v, max(best_acc, acc), best_joint_acc
+            ))
 
             if acc > best_acc:
                 best_acc = float(acc)
 
-                if not os.path.exists(args.ckpt_path):
-                    os.mkdir(args.ckpt_path)
-
-                model_name = 'best_model_of_dataset_{}_{}_alpha_{}_' \
-                             'optimizer_{}_training_epochs_{}_' \
-                             'epoch_{}_acc_{}.pth'.format(args.dataset,
-                                                          args.modulation,
-                                                          args.alpha,
-                                                          args.optimizer,
-                                                          args.modulation_starts,
-                                                          epoch, acc)
-
-                saved_dict = {'saved_epoch': epoch,
-                              'modulation': args.modulation,
-                              'alpha': args.alpha,
-                              'fusion': args.fusion_method,
-                              'acc': acc,
-                              'model': model.state_dict(),
-                              'optimizer': optimizer.state_dict(),
-                              'scheduler': scheduler.state_dict()}
-
-                save_dir = os.path.join(args.ckpt_path, model_name)
-
-                torch.save(saved_dict, save_dir)
+                save_dir = save_training_checkpoint(args, model, optimizer, scheduler, epoch, acc, acc_a, acc_v, tag='best_model')
                 print('The best model has been saved at {}.'.format(save_dir))
                 print("Loss: {:.3f}, Acc: {:.3f}".format(batch_loss, acc))
                 print("Audio Acc: {:.3f}， Visual Acc: {:.3f} ".format(acc_a, acc_v))
             else:
                 print("Loss: {:.3f}, Acc: {:.3f}, Best Acc: {:.3f}".format(batch_loss, acc, best_acc))
                 print("Audio Acc: {:.3f}， Visual Acc: {:.3f} ".format(acc_a, acc_v))
+
+            if joint_target_met and acc > best_joint_acc:
+                best_joint_acc = float(acc)
+                save_dir = save_training_checkpoint(args, model, optimizer, scheduler, epoch, acc, acc_a, acc_v, tag='best_joint_target_model')
+                print('The best joint-target model has been saved at {}.'.format(save_dir))
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         experiment_folder = f"experiments_{timestamp}_{args.modulation}"
         results_path = os.path.join(os.getcwd(), "results", experiment_folder)
