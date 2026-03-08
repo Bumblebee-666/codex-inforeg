@@ -19,6 +19,7 @@ REMOTE_PATH = "/data/Lab105/huangjiapeng/codex/new_InfoReg_CVPR2025"
 MANIFEST_NAME = ".codex_sync_manifest"
 REPO_ROOT = Path(__file__).resolve().parent
 SAFE_DIRECTORY = str(REPO_ROOT)
+ENSURED_REMOTE_DIRS = ("ckpt", "logs", "results")
 
 
 def git_command(*args: str) -> list[str]:
@@ -77,6 +78,7 @@ def build_snapshot() -> tuple[bytes, str]:
 
 
 def remote_deploy_script(remote_tar_path: str, remote_manifest_path: str) -> str:
+    ensure_dirs = " ".join(f'"$target/{name}"' for name in ENSURED_REMOTE_DIRS)
     return """
 set -euo pipefail
 target={target}
@@ -131,6 +133,7 @@ for relative_path in candidate_directories:
             pass
 PY
 tar -xf "$new_archive" -C "$target"
+mkdir -p {ensure_dirs}
 mv "$new_manifest" "$old_manifest"
 rm -f "$new_archive"
 echo "Remote deploy complete: $target"
@@ -139,6 +142,7 @@ echo "Remote deploy complete: $target"
         manifest_name=MANIFEST_NAME,
         new_manifest=shlex.quote(remote_manifest_path),
         new_archive=shlex.quote(remote_tar_path),
+        ensure_dirs=ensure_dirs,
     )
 
 
