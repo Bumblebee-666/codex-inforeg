@@ -77,8 +77,22 @@ def get_arguments():
     parser.add_argument('--sw_k_threshold', default=0.05, type=float)
     parser.add_argument('--sw_start_epoch', default=5, type=int)
     parser.add_argument('--sw_end_epoch', default=30, type=int)
+    parser.add_argument('--trace_k_strategy', default='joint_min', type=str,
+                        choices=['audio', 'visual', 'mean', 'joint_min'],
+                        help='Trace-k source used to trigger balancing strategies')
+    parser.add_argument('--sw_target_branch', default='weaker', type=str,
+                        choices=['both', 'weaker', 'visual', 'audio'],
+                        help='Which unimodal branch receives focal weighting when sample weighting is enabled')
+    parser.add_argument('--sw_confidence_margin', default=0.015, type=float,
+                        help='Minimum audio-visual confidence gap before sample weighting focuses on the weaker branch')
     parser.add_argument('--lambda_audio', default=1.0, type=float, help='Weight for audio branch loss')
     parser.add_argument('--lambda_visual', default=1.25, type=float, help='Weight for visual branch loss')
+    parser.add_argument('--balance_start_epoch', default=8, type=int,
+                        help='First epoch where balance regularization can be applied')
+    parser.add_argument('--balance_scope', default='heads', type=str, choices=['heads', 'backbone', 'all'],
+                        help='Parameter scope regularized by modality balancing')
+    parser.add_argument('--balance_confidence_margin', default=0.02, type=float,
+                        help='Minimum confidence gap required before modality balancing intervenes')
     parser.add_argument('--cmob_beta_cap', default=1.5, type=float, help='Upper bound for CMoB beta scaling')
     parser.add_argument('--cmob_beta_warmup_epochs', default=5, type=int, help='Warmup epochs before full CMoB effect')
     parser.add_argument('--cmob_ema_momentum', default=0.9, type=float, help='EMA momentum for CMoB gap smoothing')
@@ -102,6 +116,81 @@ def compute_trace_k(trace_list, window=10):
     previous_mean = float(np.mean(previous_window))
     denominator = max(abs(current_mean), 1e-8)
     return (current_mean - previous_mean) / denominator
+
+
+def compute_dual_trace_metrics(audio_trace_list, visual_trace_list, strategy='joint_min', window=10):
+    audio_k = compute_trace_k(audio_trace_list, window=window)
+    visual_k = compute_trace_k(visual_trace_list, window=window)
+
+    if strategy == 'audio':
+        trigger_k = audio_k
+    elif strategy == 'visual':
+        trigger_k = visual_k
+    elif strategy == 'mean':
+        trigger_k = 0.5 * (audio_k + visual_k)
+    else:
+        trigger_k = min(audio_k, visual_k)
+
+    return audio_k, visual_k, trigger_k
+
+
+def resolve_sw_branch_focus(args, avg_conf_a, avg_conf_v, sw_enabled):
+    if not sw_enabled:
+        return False, False
+
+    if args.sw_target_branch == 'both':
+        return True, True
+    if args.sw_target_branch == 'audio':
+        return True, False
+    if args.sw_target_branch == 'visual':
+        return False, True
+
+    conf_gap = float(avg_conf_a - avg_conf_v)
+    if abs(conf_gap) < args.sw_confidence_margin:
+        return False, False
+
+    if conf_gap > 0:
+        return False, True
+    return True, False
+
+
+def balance_scope_matches(name, branch, scope):
+    if scope == 'heads':
+        branch_tags = {
+            'audio': ['head_audio'],
+            'visual': ['head_video'],
+        }
+    elif scope == 'backbone':
+        branch_tags = {
+            'audio': ['audio_net'],
+            'visual': ['visual_net'],
+        }
+    else:
+        branch_tags = {
+            'audio': ['audio_net', 'head_audio'],
+            'visual': ['visual_net', 'head_video'],
+        }
+
+    return any(tag in name for tag in branch_tags[branch])
+
+
+def apply_branch_regularizer(model, global_model, audio_reg, visual_reg, scope):
+    audio_reg_value = float(audio_reg.item()) if audio_reg is not None else 0.0
+    visual_reg_value = float(visual_reg.item()) if visual_reg is not None else 0.0
+    global_named_params = dict(global_model.named_parameters())
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad or param.grad is None:
+            continue
+
+        global_param = global_named_params.get(name)
+        if global_param is None:
+            continue
+
+        if audio_reg_value > 0 and balance_scope_matches(name, 'audio', scope):
+            param.grad += audio_reg * (param - global_param)
+        elif visual_reg_value > 0 and balance_scope_matches(name, 'visual', scope):
+            param.grad += visual_reg * (param - global_param)
 
 
 def save_training_checkpoint(args, model, optimizer, scheduler, epoch, acc, acc_a, acc_v, tag='best_model'):
@@ -313,19 +402,20 @@ def train_epoch(args, epoch, model, device, dataloader, optimizer, scheduler, wr
     total_visual_grad_sum = 0
     total_audio_count = 0
     total_visual_count = 0
-    alpha1 = 0 
-    k = compute_trace_k(audio_trace_list)
-        
+    alpha1 = 0
+    trace_ready = min(len(audio_trace_list), len(visual_trace_list)) >= 11
+    audio_k, visual_k, k = compute_dual_trace_metrics(
+        audio_trace_list,
+        visual_trace_list,
+        strategy=args.trace_k_strategy,
+    )
 
-
-    
-    
     if epoch < 0:
         mu_v = 1
         mu_a = 2.5
     else:
         mu_a =0
-    
+
     ce_criterion = nn.CrossEntropyLoss()
     focal_criterion = None
     current_gamma = 0.0
@@ -336,7 +426,7 @@ def train_epoch(args, epoch, model, device, dataloader, optimizer, scheduler, wr
         elif args.sw_mode == 'epoch_range':
             sw_enabled = (epoch >= args.sw_start_epoch) and (epoch <= args.sw_end_epoch)
         else:
-            sw_enabled = (len(audio_trace_list) >= 11) and (k > args.sw_k_threshold)
+            sw_enabled = trace_ready and (k > args.sw_k_threshold)
 
         if sw_enabled:
             if args.sw_mode == 'epoch_range':
@@ -347,12 +437,14 @@ def train_epoch(args, epoch, model, device, dataloader, optimizer, scheduler, wr
             focal_criterion = FocalLoss(gamma=current_gamma)
 
     if writer is not None:
+        writer.add_scalar('training/trace_k_audio', audio_k, epoch)
+        writer.add_scalar('training/trace_k_visual', visual_k, epoch)
         writer.add_scalar('training/trace_k', k, epoch)
         writer.add_scalar('training/sw_enabled', float(sw_enabled), epoch)
         writer.add_scalar('training/focal_gamma', current_gamma, epoch)
 
-    def branch_criterion_fn(logits, targets):
-        if args.use_sample_weighting and sw_enabled and focal_criterion is not None:
+    def branch_criterion_fn(logits, targets, use_focal=False):
+        if use_focal and focal_criterion is not None:
             return focal_criterion(logits, targets)
         return ce_criterion(logits, targets)
     
@@ -390,6 +482,14 @@ def train_epoch(args, epoch, model, device, dataloader, optimizer, scheduler, wr
     
 
     _loss = 0
+    sw_audio_steps = 0
+    sw_visual_steps = 0
+    audio_regularized_steps = 0
+    visual_regularized_steps = 0
+    audio_regularizer_sum = 0.0
+    visual_regularizer_sum = 0.0
+    lambda_audio_sum = 0.0
+    lambda_visual_sum = 0.0
 
 
 
@@ -481,29 +581,49 @@ def train_epoch(args, epoch, model, device, dataloader, optimizer, scheduler, wr
         #     out_a = (torch.mm(a, torch.transpose(model.module.fusion_module.fc_out.weight[:, :weight_size // 2], 0, 1))
         #              + model.module.fusion_module.fc_out.bias / 2)
 
-        loss = ce_criterion(out, label)
-        loss_out_v = branch_criterion_fn(out_v, label)
-        loss_out_a = branch_criterion_fn(out_a, label)
-        weighted_loss_out_a = args.lambda_audio * loss_out_a
-        weighted_loss_out_v = args.lambda_visual * loss_out_v
+        with torch.no_grad():
+            softmax_v = softmax(out_v)
+            avg_conf_v = torch.mean(softmax_v.gather(1, label.view(-1, 1))).item()
+            _, predicted_labels_v = torch.max(softmax_v, dim=1)
+            batch_acc_v = torch.mean((predicted_labels_v == label).float()).item()
+
+            softmax_a = softmax(out_a)
+            avg_conf_a = torch.mean(softmax_a.gather(1, label.view(-1, 1))).item()
+            _, predicted_labels_a = torch.max(softmax_a, dim=1)
+            batch_acc_a = torch.mean((predicted_labels_a == label).float()).item()
 
         if epoch_data_lists is not None:
-            with torch.no_grad():
-                softmax_func = torch.nn.Softmax(dim=1)
-            
-                softmax_v = softmax_func(out_v)
-                avg_conf_v = torch.mean(softmax_v.gather(1, label.view(-1, 1))).item()
-                _, predicted_labels_v = torch.max(softmax_v, dim=1)
-                batch_acc_v = torch.mean((predicted_labels_v == label).float()).item()
-                epoch_data_lists['conf_v'].append(avg_conf_v)
-                epoch_data_lists['acc_v'].append(batch_acc_v)
+            epoch_data_lists['conf_v'].append(avg_conf_v)
+            epoch_data_lists['acc_v'].append(batch_acc_v)
+            epoch_data_lists['conf_a'].append(avg_conf_a)
+            epoch_data_lists['acc_a'].append(batch_acc_a)
 
-                softmax_a = softmax_func(out_a)
-                avg_conf_a = torch.mean(softmax_a.gather(1, label.view(-1, 1))).item()
-                _, predicted_labels_a = torch.max(softmax_a, dim=1)
-                batch_acc_a = torch.mean((predicted_labels_a == label).float()).item()
-                epoch_data_lists['conf_a'].append(avg_conf_a)
-                epoch_data_lists['acc_a'].append(batch_acc_a)
+        sw_focus_audio, sw_focus_visual = resolve_sw_branch_focus(args, avg_conf_a, avg_conf_v, sw_enabled)
+        if sw_focus_audio:
+            sw_audio_steps += 1
+        if sw_focus_visual:
+            sw_visual_steps += 1
+
+        confidence_gap = avg_conf_a - avg_conf_v
+        warmup = min(1.0, float(epoch + 1) / max(1, args.cmob_beta_warmup_epochs))
+        balance_ready = (epoch >= args.balance_start_epoch) and (k > args.sw_k_threshold)
+
+        dynamic_lambda_audio = args.lambda_audio
+        dynamic_lambda_visual = args.lambda_visual
+        if balance_ready and confidence_gap > args.balance_confidence_margin:
+            dynamic_lambda_visual = args.lambda_visual * (1.0 + warmup * args.cmob_visual_boost * abs(confidence_gap))
+        elif balance_ready and confidence_gap < -args.balance_confidence_margin:
+            audio_boost = max(args.cmob_audio_grad_scale - 1.0, 0.0)
+            dynamic_lambda_audio = args.lambda_audio * (1.0 + warmup * audio_boost * abs(confidence_gap))
+
+        lambda_audio_sum += dynamic_lambda_audio
+        lambda_visual_sum += dynamic_lambda_visual
+
+        loss = ce_criterion(out, label)
+        loss_out_v = branch_criterion_fn(out_v, label, use_focal=sw_focus_visual)
+        loss_out_a = branch_criterion_fn(out_a, label, use_focal=sw_focus_audio)
+        weighted_loss_out_a = dynamic_lambda_audio * loss_out_a
+        weighted_loss_out_v = dynamic_lambda_visual * loss_out_v
 
 
         losses=[loss, weighted_loss_out_a, weighted_loss_out_v]
@@ -565,50 +685,43 @@ def train_epoch(args, epoch, model, device, dataloader, optimizer, scheduler, wr
         weighted_loss_out_a.backward(retain_graph=True)
         loss.backward()
 
-        # 初始化 beta
-        beta = torch.tensor(0.0, device=device)
-        beta2 = torch.tensor(0.0, device=device)
+        audio_reg = torch.tensor(0.0, device=device)
+        visual_reg = torch.tensor(0.0, device=device)
         model.usegate = False
-        warmup = min(1.0, float(epoch + 1) / max(1, args.cmob_beta_warmup_epochs))
-        k_threshold = args.sw_k_threshold
 
-        if args.use_cmob:
-            # CMoB: gap-aware modulation with EMA smoothing and capped beta
-            gap, te_a, te_v = cmob_tool.calculate_causal_gap(model, spec, image, label, ce_criterion)
+        if args.use_cmob and balance_ready and abs(confidence_gap) >= args.balance_confidence_margin:
+            gap, _, _ = cmob_tool.calculate_causal_gap(model, spec, image, label, ce_criterion)
             scaled_gap = gap * args.cmob_gap_scale
             if ema_gap is None:
                 ema_gap = scaled_gap.detach()
             else:
                 ema_gap = args.cmob_ema_momentum * ema_gap + (1 - args.cmob_ema_momentum) * scaled_gap.detach()
             smoothed_gap = ema_gap
+            gap_value = float(smoothed_gap.item())
+            same_direction = (gap_value > 0 and confidence_gap > 0) or (gap_value < 0 and confidence_gap < 0)
 
-            if smoothed_gap > 0 and k > k_threshold:
-                # audio dominates: penalize audio (exp-based, same as original), lightly support visual
-                beta = warmup * torch.clamp(0.95 * torch.exp(smoothed_gap), max=args.cmob_beta_cap)
-                beta2 = warmup * args.cmob_visual_boost * torch.tanh(torch.abs(smoothed_gap))
-            elif smoothed_gap < 0 and k > k_threshold:
-                # visual dominates: penalize visual proportionally (tanh-based, avoids always-capped issue)
-                beta2 = warmup * torch.clamp(args.cmob_beta_cap * torch.tanh(torch.abs(smoothed_gap)), max=args.cmob_beta_cap)
+            if same_direction and gap_value > 0:
+                audio_reg = warmup * torch.clamp(0.95 * torch.exp(smoothed_gap), max=args.cmob_beta_cap)
+            elif same_direction and gap_value < 0:
+                visual_reg = warmup * torch.clamp(args.cmob_beta_cap * torch.tanh(torch.abs(smoothed_gap)), max=args.cmob_beta_cap)
 
-        else:
-            # Original score-based branch, aligned with the same threshold/caps
-            score_v = sum([softmax(out_v)[i][label[i]] for i in range(out_v.size(0))])
-            score_a = sum([softmax(out_a)[i][label[i]] for i in range(out_a.size(0))])
+        elif balance_ready and abs(confidence_gap) >= args.balance_confidence_margin:
+            reg_gap = tanh(torch.tensor(abs(confidence_gap), device=device))
+            if confidence_gap > 0:
+                audio_reg = warmup * torch.clamp(0.95 * torch.exp(reg_gap), max=args.cmob_beta_cap)
+            else:
+                visual_reg = warmup * torch.clamp(0.1 * torch.exp(reg_gap), max=args.cmob_beta_cap)
 
-            if (score_a > score_v) and k > k_threshold:
-                gap = tanh(score_a - score_v)
-                beta = warmup * torch.clamp(0.95 * torch.exp(gap), max=args.cmob_beta_cap)
-                beta2 = warmup * args.cmob_visual_boost * torch.tanh(torch.abs(gap))
-            elif (score_a < score_v) and k > k_threshold:
-                gap = tanh(score_v - score_a)
-                beta2 = warmup * torch.clamp(0.1 * torch.exp(gap), max=args.cmob_beta_cap)
-        for model_param, global_model_param in zip(model.parameters(),global_model.parameters()):
+        audio_reg_value = float(audio_reg.item())
+        visual_reg_value = float(visual_reg.item())
+        if audio_reg_value > 0:
+            audio_regularized_steps += 1
+            audio_regularizer_sum += audio_reg_value
+        if visual_reg_value > 0:
+            visual_regularized_steps += 1
+            visual_regularizer_sum += visual_reg_value
 
-            if model_param.requires_grad and any(model_param is param for param in model.module.audio_net.parameters()):
-                model_param.grad += beta * (model_param - global_model_param)
-
-            if model_param.requires_grad and any(model_param is param for param in model.module.visual_net.parameters()):
-                model_param.grad += beta2 * (model_param - global_model_param)
+        apply_branch_regularizer(model, global_model, audio_reg, visual_reg, args.balance_scope)
 
         for name, module in model.named_modules():
             if isinstance(module, torch.nn.Conv2d) or isinstance(module, torch.nn.Linear):
@@ -703,10 +816,19 @@ def train_epoch(args, epoch, model, device, dataloader, optimizer, scheduler, wr
     
     visual_trace_list.append(fim_trace_visual)
     audio_trace_list.append(fim_trace_audio)
-    print(audio_trace_list)
-    writer.add_scalar('fim_trace_visual_head',fim_trace_visual_head,epoch)
-    writer.add_scalar('fim_trace_audio_head',fim_trace_audio_head,epoch)
-    writer.add_scalar('fim_trace_mm_head',fim_trace_mm_head,epoch)
+
+    if writer is not None:
+        writer.add_scalar('fim_trace_visual_head',fim_trace_visual_head,epoch)
+        writer.add_scalar('fim_trace_audio_head',fim_trace_audio_head,epoch)
+        writer.add_scalar('fim_trace_mm_head',fim_trace_mm_head,epoch)
+        writer.add_scalar('training/sw_audio_step_ratio', sw_audio_steps / max(1, len(dataloader)), epoch)
+        writer.add_scalar('training/sw_visual_step_ratio', sw_visual_steps / max(1, len(dataloader)), epoch)
+        writer.add_scalar('training/balance_audio_step_ratio', audio_regularized_steps / max(1, len(dataloader)), epoch)
+        writer.add_scalar('training/balance_visual_step_ratio', visual_regularized_steps / max(1, len(dataloader)), epoch)
+        writer.add_scalar('training/balance_audio_reg_mean', audio_regularizer_sum / max(1, audio_regularized_steps), epoch)
+        writer.add_scalar('training/balance_visual_reg_mean', visual_regularizer_sum / max(1, visual_regularized_steps), epoch)
+        writer.add_scalar('training/lambda_audio_dynamic', lambda_audio_sum / max(1, len(dataloader)), epoch)
+        writer.add_scalar('training/lambda_visual_dynamic', lambda_visual_sum / max(1, len(dataloader)), epoch)
 
     scheduler.step()
 
